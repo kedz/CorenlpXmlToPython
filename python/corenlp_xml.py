@@ -1,27 +1,50 @@
 import xml.etree.ElementTree as ET
 
 class Document:
-    def __init__(self, f):
+    def __init__(self, fname, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
+        self.fname = fname
         self.sentences = []
-        self._ingest(f)
-
-    def _ingest(self, f):
-        tree = ET.parse(f)
-        #root = tree.getroot()
+        
+        tree = ET.parse(fname)
         sentences = tree.findall('//sentences/sentence')
         for s in sentences:
-            self.sentences.append(Sentence(s))
+            self.sentences.append(Sentence(s, basic_deps=basic_deps, collapsed_deps=collapsed_deps, collapsed_ccproc_deps=collapsed_ccproc_deps))
+
+
+    def __iter__(self):
+        return iter(self.sentences)
+
                         
 
 class Sentence:
-    def __init__(self, sentence):
+    def __init__(self, sentence, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
         self.tokens = []
-        self.typed_deps = set()
-        deps = sentence.findall('.//dependencies')[2]
+        
+        self.basic_deps = set() if basic_deps else None
+        self.coll_deps = set() if collapsed_deps else None
+        self.coll_ccp_deps = set() if collapsed_ccproc_deps else None
+        
+        self.deps = self.basic_deps if basic_deps else None
+        self.deps = self.coll_deps if collapsed_deps else None
+        self.deps = self.coll_ccp_deps if collapsed_ccproc_deps else None
+        
         tokens = sentence.findall('.//token')
         for t in tokens:
             self.tokens.append(Token(t))
-        self._build_deps(deps)
+        
+        deps_types = sentence.findall('.//dependencies')
+        for deps in deps_types:
+            if deps.get('type') == 'basic-dependencies' and basic_deps:
+                self._build_deps(deps, self.basic_deps)
+            if deps.get('type') == 'collapsed-dependencies' and collapsed_deps:
+                self._build_deps(deps, self.coll_deps)
+            if deps.get('type') == 'collapsed-ccprocessed-dependencies' and collapsed_ccproc_deps:
+                self._build_deps(deps, self.coll_ccp_deps)
+    
+        
+
+    def __iter__(self):
+        return iter(self.tokens)
             
     def space_sep_str(self):
         str_buff = self.tokens[0].word
@@ -29,7 +52,8 @@ class Sentence:
             str_buff += ' ' + t.word
         return str_buff
 
-    def _build_deps(self, deps):
+    def _build_deps(self, deps, deps_set):
+                
         for dep in deps:
             for arg in dep:
                 
@@ -39,8 +63,9 @@ class Sentence:
                     dep_idx = int(arg.get('idx')) - 1
                     
             dtype = dep.get('type')
-            self.typed_deps.add(Dependency(dtype, gov_idx, dep_idx, self))
-            
+            deps_set.add(Dependency(dtype, gov_idx, dep_idx, self))
+        
+                
 class Token:
     def __init__(self, token):
         self.word = None
