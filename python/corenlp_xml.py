@@ -1,23 +1,64 @@
 import xml.etree.ElementTree as ET
+from os.path import exists
 
 class Document:
-    def __init__(self, fname, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
-        self.fname = fname
+    def __init__(self, fname_or_string, coref=False, parse=False, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
+        self.fname = None
         self.sentences = []
-        
-        tree = ET.parse(fname)
-        sentences = tree.findall('//sentences/sentence')
-        for s in sentences:
-            self.sentences.append(Sentence(s, basic_deps=basic_deps, collapsed_deps=collapsed_deps, collapsed_ccproc_deps=collapsed_ccproc_deps))
+        self.coref = []
 
+        if exists(fname_or_string):
+            tree = ET.parse(fname_or_string)
+        else:
+            tree = ET.fromstring(fname_or_string)
+        
+        sentences = tree.findall('.//sentences/sentence')
+        for s in sentences:
+            self.sentences.append(Sentence(s, parse=parse, basic_deps=basic_deps, collapsed_deps=collapsed_deps, collapsed_ccproc_deps=collapsed_ccproc_deps))
+
+        if coref:
+            coref_chains = tree.findall('.//coreference/coreference') 
+            print len(coref_chains)
+            for coref_chain in coref_chains:
+                self.coref.append(CorefChain(coref_chain, self))
+
+        tree = None
 
     def __iter__(self):
         return iter(self.sentences)
 
                         
 
+class CorefChain:
+    def __init__(self, coref_el, doc):
+        #mentions = coref_el.findall('//mention')
+        self.mentions = []
+        for mention in coref_el:
+            
+            for t in mention:
+                if t.tag == 'sentence':
+                    sent = int(t.text) - 1
+                if t.tag == 'start':
+                    start = int(t.text) - 1
+                if t.tag == 'end':
+                    end = int(t.text) - 1
+                if t.tag == 'head':
+                    head = int(t.text) - 1
+            self.mentions.append(Mention(sent, start, end, head))
+            doc.sentences[sent].tokens[head].coref_chain = self
+        
+            
+
+class Mention:
+    def __init__(self, sentence, start, end, head):
+        self.sent = sentence
+        self.start = start
+        self.end = end
+        self.head = head
+
+
 class Sentence:
-    def __init__(self, sentence, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
+    def __init__(self, sentence, parse=False, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
         self.tokens = []
         
         self.basic_deps = set() if basic_deps else None
@@ -32,6 +73,14 @@ class Sentence:
         for t in tokens:
             self.tokens.append(Token(t))
         
+        parse_str = sentence.findall('.//parse')
+        if parse:
+            from nltk.tree import Tree
+        self.parse = Tree(parse_str[0].text) if parse else None
+
+
+
+
         deps_types = sentence.findall('.//dependencies')
         for deps in deps_types:
             if deps.get('type') == 'basic-dependencies' and basic_deps:
@@ -74,6 +123,7 @@ class Token:
         self.pos = None
         self.lem = None
         self.ne = None
+        self.coref_chain = None
 
         for child in token:
             if child.tag == 'word':
