@@ -1,9 +1,12 @@
 import xml.etree.ElementTree as ET
-from os.path import exists
+from os.path import exists, join
 from collections import defaultdict
+import tempfile
+from subprocess import check_output
+import timex
 
 class Document:
-    def __init__(self, fname_or_string, coref=False, parse=False, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
+    def __init__(self, fname_or_string, coref=False, parse=False, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True, size_cutoff=None):
         self.fname = None
         self.sentences = []
         self.coref = []
@@ -15,8 +18,9 @@ class Document:
             tree = ET.fromstring(fname_or_string)
         
         sentences = tree.findall('.//sentences/sentence')
-        for s in sentences:
-            self.sentences.append(Sentence(s, parse=parse, basic_deps=basic_deps, collapsed_deps=collapsed_deps, collapsed_ccproc_deps=collapsed_ccproc_deps))
+        for i, s in enumerate(sentences):
+            if not size_cutoff or i < size_cutoff:
+                self.sentences.append(Sentence(s, parse=parse, basic_deps=basic_deps, collapsed_deps=collapsed_deps, collapsed_ccproc_deps=collapsed_ccproc_deps))
 
         if coref:
             coref_chains = tree.findall('.//coreference/coreference') 
@@ -98,6 +102,8 @@ class Sentence:
             pos = None
             lem = None
             ne = None
+            norm_ne = None
+            timex_tag = None
             for child in token:
                 if child.tag == 'word':
                     word = child.text
@@ -111,6 +117,19 @@ class Sentence:
                     lem = child.text
                 elif child.tag == 'NER':
                     ne = child.text    
+                elif child.tag == 'Timex':
+                    timex_tag = timex.make_timex(child.get('tid'), child.get('type'), child.text)
+                elif child.tag == 'NormalizedNER':
+                    norm_ne = child.text
+                else:
+                    import sys
+                    sys.stderr.write("Warning: Unrecognized Token('{}') " \
+                                     "Property: <{}>{}</{}>".format(word,
+                                                            child.tag,
+                                                            child.text,
+                                                            child.tag))
+                    sys.stderr.flush()
+
             self.tokens.append(Token(word,
                                      char_offset_start,
                                      char_offset_end,
@@ -143,6 +162,9 @@ class Sentence:
 
     def __iter__(self):
         return iter(self.tokens)
+      
+    def __getitem__(self, index):
+        return self.tokens[index]      
             
     def space_sep_str(self):
         str_buff = self.tokens[0].word
@@ -259,8 +281,29 @@ class DependencyGraph:
         G.draw('/tmp/deptree.png')
         from IPython.display import Image
         return Image(filename='/tmp/deptree.png')
-           
-    
-    #def _build_graph(self, dep):
-    #    token = dep.dep
-     #   for      
+      
+
+     
+def run_pipeline(annotators, input_files, output_dir, mem='2500m', corenlp_dir=None):
+    flist = tempfile.NamedTemporaryFile()
+    flist.write('\n'.join(input_files))
+    flist.flush()
+
+    if corenlp_dir == None:
+        corenlp_dir = '.'
+    jars = ['joda-time.jar', 'jollyday.jar', 'stanford-corenlp-3.2.0.jar',
+            'stanford-corenlp-3.2.0-models.jar', 'xom.jar']
+    classpath = ':'.join([join(corenlp_dir, jar) for jar in jars]) 
+    pipeline = 'edu.stanford.nlp.pipeline.StanfordCoreNLP'
+    cmd = 'java -Xmx{} -cp {} {} '\
+          '-annotators {} -filelist {} '\
+          '-outputDirectory {}'.format(mem,
+                                       classpath,
+                                       pipeline,
+                                       ','.join(annotators),
+                                       flist.name, 
+                                       output_dir)
+    check_output(cmd, shell=True)
+    flist.close()
+
+            
