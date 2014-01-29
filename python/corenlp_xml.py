@@ -1,12 +1,26 @@
 import xml.etree.ElementTree as ET
+from os import remove
 from os.path import exists, join
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import tempfile
 from subprocess import check_output
 import timex
 
 class Document:
-    def __init__(self, fname_or_string, coref=False, parse=False, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True, size_cutoff=None):
+    def __init__(self,
+                 fname_or_string,
+                 ssplit=True,
+                 pos=True,
+                 lemma=True,
+                 ner=True,
+                 parse=False,
+                 coref=False,
+                 basic_deps=False,
+                 collapsed_deps=False,
+                 collapsed_ccproc_deps=True,
+                 size_cutoff=None,
+                 timex_ne=True,
+                 verbose=False):
         self.fname = None
         self.sentences = []
         self.coref = []
@@ -17,17 +31,34 @@ class Document:
         else:
             tree = ET.fromstring(fname_or_string)
         
+        
         sentences = tree.findall('.//sentences/sentence')
         for i, s in enumerate(sentences):
             if not size_cutoff or i < size_cutoff:
-                self.sentences.append(Sentence(s, parse=parse, basic_deps=basic_deps, collapsed_deps=collapsed_deps, collapsed_ccproc_deps=collapsed_ccproc_deps))
+                self.sentences.append(Sentence(s,
+                                               pos=pos,
+                                               lemma=lemma,
+                                               ner=ner,
+                                               parse=parse,
+                                               basic_deps=basic_deps,
+                                               collapsed_deps=collapsed_deps,
+                                               collapsed_ccproc_deps=collapsed_ccproc_deps,
+                                               timex_ne=timex_ne,
+                                               verbose=verbose))
 
         if coref:
             coref_chains = tree.findall('.//coreference/coreference') 
             print len(coref_chains)
             for coref_chain in coref_chains:
                 self.coref.append(CorefChain(coref_chain, self))
-
+        if timex_ne:
+            self.timex = OrderedDict()
+            for s in self.sentences:
+                for t in s:
+                    if t.timex:
+                        if t.timex not in self.timex:
+                            self.timex[t.timex] = []
+                        self.timex[t.timex].append(t)
         tree = None
 
     def __getitem__(self, index):
@@ -81,7 +112,17 @@ class Mention:
 
 
 class Sentence:
-    def __init__(self, sentence, parse=False, basic_deps=False, collapsed_deps=False, collapsed_ccproc_deps=True):
+    def __init__(self,
+                 sentence,
+                 pos=True, 
+                 lemma=True,
+                 ner=True,
+                 parse=False,
+                 basic_deps=False,
+                 collapsed_deps=False,
+                 collapsed_ccproc_deps=True,
+                 timex_ne=True,
+                 verbose=False):
         self.tokens = []
         
         self.basic_deps = set() if basic_deps else None
@@ -99,7 +140,7 @@ class Sentence:
             word = None
             char_offset_start = None
             char_offset_end = None
-            pos = None
+            pos_tag = None
             lem = None
             ne = None
             norm_ne = None
@@ -111,17 +152,26 @@ class Sentence:
                     char_offset_start = int(child.text)
                 elif child.tag == 'CharacterOffsetEnd':
                     char_offset_end = int(child.text)
-                elif child.tag == 'POS':
-                    pos = child.text
-                elif child.tag == 'lemma':
+                elif child.tag == 'POS' and pos:
+                    pos_tag = child.text
+                elif child.tag == 'lemma' and lemma:
                     lem = child.text
-                elif child.tag == 'NER':
+                elif child.tag == 'NER' and lemma:
                     ne = child.text    
                 elif child.tag == 'Timex':
-                    timex_tag = timex.make_timex(child.get('tid'), child.get('type'), child.text)
+                    if timex_ne:
+                        timex_tag = timex.make_timex(child.get('tid'), child.get('type'), child.text, verbose=verbose)
+                        if timex_tag and '<{} \'{}\'>'.format(child.get('type'), child.text) != str(timex_tag):
+                            import sys
+                            sys.stderr.write("BAD TIMEX TAG -- DYING {} - {}\n".format(child.text, str(timex_tag)))
+                            sys.stderr.flush()
+                            sys.exit()
+                        if not timex_tag and verbose:
+                            print word, norm_ne, ' - ', child.text
+
                 elif child.tag == 'NormalizedNER':
                     norm_ne = child.text
-                else:
+                elif verbose:
                     import sys
                     sys.stderr.write("Warning: Unrecognized Token('{}') " \
                                      "Property: <{}>{}</{}>".format(word,
@@ -133,9 +183,11 @@ class Sentence:
             self.tokens.append(Token(word,
                                      char_offset_start,
                                      char_offset_end,
-                                     pos,
+                                     pos_tag,
                                      lem,
-                                     ne))
+                                     ne,
+                                     norm_ne,
+                                     timex_tag))
         
         parse_str = sentence.findall('.//parse')
         if parse:
@@ -195,15 +247,19 @@ class Token:
                  char_offset_end=None,
                  pos=None,
                  lem=None,
-                 ne = None):
+                 ne=None,
+                 norm_ne=None,
+                 timex_tag=None):
         self.word = word.encode('utf-8')
         self.char_offset_start = char_offset_start
         self.char_offset_end = char_offset_end
         self.pos = pos
-        self.lem = lem.encode('utf-8')
+        self.lem = lem.encode('utf-8') if lem else None
         self.ne = ne
         self.coref_chain = None
         self.deps = []
+        self.norm_ne = norm_ne
+        self.timex = timex_tag
 
     def __str__(self):
         return self.word
@@ -281,10 +337,144 @@ class DependencyGraph:
         G.draw('/tmp/deptree.png')
         from IPython.display import Image
         return Image(filename='/tmp/deptree.png')
-      
 
-     
-def run_pipeline(annotators, input_files, output_dir, mem='2500m', corenlp_dir=None):
+
+def annotate_list(annotators, txts, mem='2500m', threads=1, corenlp_dir=None):
+
+    tmpfiles = []
+
+    for txt in txts:
+        tf = tempfile.NamedTemporaryFile(delete=False)
+        tf.write(txt)
+        tf.flush()
+        tf.close
+        tmpfiles.append(tf.name)
+    run_pipeline(annotators,
+                 tmpfiles,
+                 '/tmp',
+                 mem=mem,
+                 threads=threads,
+                 corenlp_dir=corenlp_dir)
+    
+    pos = True if 'pos' in annotators else False
+    lemma = True if 'lemma' in annotators else False
+    ner = True if 'ner' in annotators else False
+    parse = True if 'parse' in annotators else False
+    coref = True if 'dcoref' in annotators else False
+
+    docs = [] 
+    for tmpfile in tmpfiles:
+        doc = Document('{}.xml'.format(tmpfile),
+                       pos=pos,
+                       lemma=lemma,
+                       ner=ner,
+                       parse=parse,
+                       coref=coref) 
+        docs.append(doc)     
+    return docs
+ 
+
+def annotate(annotators, txt, mem='2500m', threads=1, corenlp_dir=None):
+    tf = tempfile.NamedTemporaryFile()
+    tf.write(txt)
+    tf.flush()
+    
+    if corenlp_dir == None:
+        corenlp_dir = '.'
+    jars = ['joda-time.jar', 'jollyday.jar', 'stanford-corenlp-3.2.0.jar',
+            'stanford-corenlp-3.2.0-models.jar', 'xom.jar']
+    classpath = ':'.join([join(corenlp_dir, jar) for jar in jars]) 
+    pipeline = 'edu.stanford.nlp.pipeline.StanfordCoreNLP'
+    cmd = 'java -Xmx{} -cp {} {} '\
+          '-annotators {} -file {} '\
+          '-outputDirectory {} -threads {}'.format(mem,
+                                                   classpath,
+                                                   pipeline,
+                                                   ','.join(annotators),
+                                                   tf.name,
+                                                   '/tmp',
+                                                   threads)
+    
+    check_output(cmd, shell=True)
+    
+    ssplit = True if 'ssplit' in annotators else False
+    pos = True if 'pos' in annotators else False
+    lemma = True if 'lemma' in annotators else False
+    ner = True if 'ner' in annotators else False
+    parse = True if 'parse' in annotators else False
+    coref = True if 'dcoref' in annotators else False
+
+    doc = Document('{}.xml'.format(tf.name),
+                   ssplit=ssplit,
+                   pos=pos,
+                   lemma=lemma,
+                   ner=ner,
+                   parse=parse,
+                   coref=coref) 
+    tf.close()
+    
+    return doc
+
+def annotate_dict(annotators,
+                  a_dict,
+                  mem='2500m',
+                  threads=1,
+                  corenlp_dir=None):
+
+    flist = []
+    fdict = {}
+    for k in a_dict.keys():
+        if isinstance(a_dict[k], list): 
+            items = []
+#or isinstance(a_dict[k], tuple) or isinstance(a_dict[k], set): 
+            for txt in a_dict[k]:
+                tf = tempfile.NamedTemporaryFile(delete=False)
+                tf.write(txt)
+                tf.flush()
+                tf.close()
+                items.append(tf.name)
+                flist.append(tf.name)
+            fdict[k] = items
+
+    run_pipeline(annotators,
+                 flist,
+                 '/tmp/',
+                 mem=mem,
+                 threads=threads,
+                 corenlp_dir=corenlp_dir)
+
+    ssplit = True if 'ssplit' in annotators else False
+    pos = True if 'pos' in annotators else False
+    lemma = True if 'lemma' in annotators else False
+    ner = True if 'ner' in annotators else False
+    parse = True if 'parse' in annotators else False
+    coref = True if 'dcoref' in annotators else False
+
+    docmap = {}
+    for k in fdict.keys():
+        docs = []
+        for f in fdict[k]:
+            doc = Document('{}.xml'.format(f),
+                           ssplit=ssplit,
+                           pos=pos,
+                           lemma=lemma,
+                           ner=ner, 
+                           parse=parse,
+                           coref=coref)
+
+            docs.append(doc)
+            remove('{}.xml'.format(f))
+            remove(f)
+        docmap[k] = docs
+        
+    return docmap
+
+def run_pipeline(annotators,
+                 input_files,
+                 output_dir,
+                 mem='2500m',
+                 threads=1,
+                 corenlp_dir=None):
     flist = tempfile.NamedTemporaryFile()
     flist.write('\n'.join(input_files))
     flist.flush()
@@ -297,13 +487,15 @@ def run_pipeline(annotators, input_files, output_dir, mem='2500m', corenlp_dir=N
     pipeline = 'edu.stanford.nlp.pipeline.StanfordCoreNLP'
     cmd = 'java -Xmx{} -cp {} {} '\
           '-annotators {} -filelist {} '\
-          '-outputDirectory {}'.format(mem,
-                                       classpath,
-                                       pipeline,
-                                       ','.join(annotators),
-                                       flist.name, 
-                                       output_dir)
+          '-outputDirectory {} -threads {}'.format(mem,
+                                                classpath,
+                                                pipeline,
+                                                ','.join(annotators),
+                                                flist.name, 
+                                                output_dir,
+                                                threads)
     check_output(cmd, shell=True)
     flist.close()
+
 
             
